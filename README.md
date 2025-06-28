@@ -1,3 +1,3 @@
-# Demo
+# DOCUMENTATION
 
-Some Description!
+This folder contains all the required files for our UTM machine
