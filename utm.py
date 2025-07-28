@@ -4,16 +4,12 @@ import serial
 import serial.tools.list_ports
 import threading
 from collections import deque
-from matplotlib import pyplot as plt
-import matplotlib
-matplotlib.use("TkAgg")
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-import numpy as np
-import tkinter as tk
-from tkinter import ttk
 from PIL import Image, ImageTk
 
+# --- Globals ---
 lc_serial = None
 ble_serial = None
 lc_running = False
@@ -21,6 +17,7 @@ ble_running = False
 lc_buffer = deque(maxlen=500)   # Store (input, output) tuples
 ble_buffer = deque(maxlen=500)  # Store selected FSR sensor readings
 
+# Adaptive PID parameters
 adaptation_enabled = False
 adaptation_window = 50
 adaptation_rate = 0.05
@@ -31,84 +28,13 @@ current_ki = 0.0
 current_kd = 0.0
 setpoint_value = 4000.0
 
-def cost_function(errors, controls, Q, R):
-    errors = np.array(errors)
-    controls = np.array(controls)
-    return np.sum(Q * errors**2 + R * controls**2)
+# Automated calibration state
+calibration_results = []
+calibration_setpoints = []
+calibration_running = False
+calibration_idx = 0
 
-def send_pid_to_arduino(kp, ki, kd):
-    if lc_serial and lc_serial.is_open:
-        cmd = f"PID,{kp},{ki},{kd}\n"
-        lc_serial.write(cmd.encode())
-        output_text1.insert(tk.END, f"Sent: {cmd}")
-        output_text1.see(tk.END)
-
-def send_setpoint_to_arduino(sp):
-    if lc_serial and lc_serial.is_open:
-        cmd = f"SET,{sp}\n"
-        lc_serial.write(cmd.encode())
-        output_text1.insert(tk.END, f"Sent: {cmd}")
-        output_text1.see(tk.END)
-
-def adaptation_loop():
-    global current_kp, current_ki, current_kd
-    if not adaptation_enabled:
-        return
-
-    if len(lc_buffer) >= adaptation_window:
-        # Extract recent window
-        recent = list(lc_buffer)[-adaptation_window:]
-        inputs = [x[0] for x in recent]
-        outputs = [x[1] for x in recent]
-        errors = [setpoint_value - i for i in inputs]
-        cost_now = cost_function(errors, outputs, Q, R)
-
-        # Try increasing Kp
-        test_kp = current_kp + adaptation_rate
-        send_pid_to_arduino(test_kp, current_ki, current_kd)
-        # Wait for new data to accumulate
-        root.after(adaptation_window * 20, lambda: evaluate_kp(test_kp, cost_now, direction="up"))
-    else:
-        root.after(1000, adaptation_loop)
-
-def evaluate_kp(test_kp, cost_prev, direction):
-    global current_kp, current_ki, current_kd
-    if len(lc_buffer) >= adaptation_window:
-        recent = list(lc_buffer)[-adaptation_window:]
-        inputs = [x[0] for x in recent]
-        outputs = [x[1] for x in recent]
-        errors = [setpoint_value - i for i in inputs]
-        cost_test = cost_function(errors, outputs, Q, R)
-
-        if cost_test < cost_prev:
-            current_kp = test_kp
-            send_pid_to_arduino(current_kp, current_ki, current_kd)
-            output_text1.insert(tk.END, f"Adapted Kp to {current_kp:.3f}\n")
-            output_text1.see(tk.END)
-            # Continue adaptation
-            root.after(1000, adaptation_loop)
-        else:
-            # Try decreasing Kp if increasing didn't help
-            if direction == "up":
-                test_kp = current_kp - adaptation_rate
-                send_pid_to_arduino(test_kp, current_ki, current_kd)
-                root.after(adaptation_window * 20, lambda: evaluate_kp(test_kp, cost_prev, direction="down"))
-            else:
-                # No improvement, revert to original
-                send_pid_to_arduino(current_kp, current_ki, current_kd)
-                root.after(1000, adaptation_loop)
-    else:
-        root.after(1000, adaptation_loop)
-
-def toggle_adaptation():
-    global adaptation_enabled
-    adaptation_enabled = not adaptation_enabled
-    if adaptation_enabled:
-        adaptation_button.config(text="Stop Adaptation")
-        root.after(1000, adaptation_loop)
-    else:
-        adaptation_button.config(text="Start Adaptation")
-
+# --- Serial Functions ---
 def list_serial_ports():
     return [port.device for port in serial.tools.list_ports.comports()]
 
@@ -167,13 +93,13 @@ def read_lc_serial():
             break
 
 def read_ble_serial():
-    mode = mode_var.get()
     while ble_running and ble_serial and ble_serial.is_open:
         try:
             line = ble_serial.readline().decode(errors='ignore').strip()
             if line:
                 output_text2.after(0, lambda l=line: (output_text2.insert(tk.END, l + '\n'), output_text2.see(tk.END)))
                 try:
+                    mode = mode_var.get()
                     if mode == "multi":
                         cleaned_line = line.strip().rstrip('_')
                         values = [float(x) for x in cleaned_line.split("_")]
@@ -188,6 +114,231 @@ def read_ble_serial():
         except Exception:
             break
 
+# --- PID/Setpoint Functions ---
+def send_pid_to_arduino(kp, ki, kd):
+    if lc_serial and lc_serial.is_open:
+        cmd = f"PID,{kp},{ki},{kd}\n"
+        lc_serial.write(cmd.encode())
+        output_text1.insert(tk.END, f"Sent: {cmd}")
+        output_text1.see(tk.END)
+
+def send_setpoint_to_arduino(sp):
+    if lc_serial and lc_serial.is_open:
+        cmd = f"SET,{sp}\n"
+        lc_serial.write(cmd.encode())
+        output_text1.insert(tk.END, f"Sent: {cmd}")
+        output_text1.see(tk.END)
+
+def send_pid():
+    global current_kp, current_ki, current_kd
+    if lc_serial and lc_serial.is_open:
+        try:
+            kp = float(kp_entry.get())
+            ki = float(ki_entry.get())
+            kd = float(kd_entry.get())
+            current_kp, current_ki, current_kd = kp, ki, kd
+            send_pid_to_arduino(kp, ki, kd)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+def send_setpoint():
+    global setpoint_value
+    if lc_serial and lc_serial.is_open:
+        try:
+            setpoint = float(setpoint_entry.get())
+            setpoint_value = setpoint
+            send_setpoint_to_arduino(setpoint)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+# --- Adaptive PID Logic ---
+def cost_function(errors, controls, Q, R):
+    errors = np.array(errors)
+    controls = np.array(controls)
+    return np.sum(Q * errors**2 + R * controls**2)
+
+def adaptation_loop():
+    global current_kp, current_ki, current_kd
+    if not adaptation_enabled:
+        return
+    if len(lc_buffer) >= adaptation_window:
+        recent = list(lc_buffer)[-adaptation_window:]
+        inputs = [x[0] for x in recent]
+        outputs = [x[1] for x in recent]
+        errors = [setpoint_value - i for i in inputs]
+        cost_now = cost_function(errors, outputs, Q, R)
+        test_kp = current_kp + adaptation_rate
+        send_pid_to_arduino(test_kp, current_ki, current_kd)
+        root.after(adaptation_window * 20, lambda: evaluate_kp(test_kp, cost_now, direction="up"))
+    else:
+        root.after(1000, adaptation_loop)
+
+def evaluate_kp(test_kp, cost_prev, direction):
+    global current_kp, current_ki, current_kd
+    if len(lc_buffer) >= adaptation_window:
+        recent = list(lc_buffer)[-adaptation_window:]
+        inputs = [x[0] for x in recent]
+        outputs = [x[1] for x in recent]
+        errors = [setpoint_value - i for i in inputs]
+        cost_test = cost_function(errors, outputs, Q, R)
+        if cost_test < cost_prev:
+            current_kp = test_kp
+            send_pid_to_arduino(current_kp, current_ki, current_kd)
+            output_text1.insert(tk.END, f"Adapted Kp to {current_kp:.3f}\n")
+            output_text1.see(tk.END)
+            root.after(1000, adaptation_loop)
+        else:
+            if direction == "up":
+                test_kp = current_kp - adaptation_rate
+                send_pid_to_arduino(test_kp, current_ki, current_kd)
+                root.after(adaptation_window * 20, lambda: evaluate_kp(test_kp, cost_prev, direction="down"))
+            else:
+                send_pid_to_arduino(current_kp, current_ki, current_kd)
+                root.after(1000, adaptation_loop)
+    else:
+        root.after(1000, adaptation_loop)
+
+def toggle_adaptation():
+    global adaptation_enabled
+    adaptation_enabled = not adaptation_enabled
+    if adaptation_enabled:
+        adaptation_button.config(text="Stop Adaptation")
+        root.after(1000, adaptation_loop)
+    else:
+        adaptation_button.config(text="Start Adaptation")
+
+# --- Automated Calibration ---
+def start_auto_calibration():
+    global calibration_results, calibration_setpoints, calibration_running, calibration_idx
+    try:
+        min_sp = int(min_setpoint_entry.get())
+        max_sp = int(max_setpoint_entry.get())
+        step = int(step_entry.get())
+        hold_time = int(hold_time_entry.get())
+    except Exception as e:
+        messagebox.showerror("Input Error", f"Invalid calibration input: {e}")
+        return
+
+    if min_sp > max_sp or step <= 0 or hold_time <= 0:
+        messagebox.showerror("Input Error", "Please enter valid calibration parameters.")
+        return
+
+    calibration_results.clear()
+    calibration_setpoints = list(range(min_sp, max_sp + 1, step))
+    calibration_running = True
+    calibration_idx = 0
+    output_text1.insert(tk.END, f"Starting calibration: {calibration_setpoints}\n")
+    output_text1.see(tk.END)
+    run_setpoint_sequence(hold_time)
+
+def run_setpoint_sequence(hold_time):
+    global calibration_idx, calibration_running
+    if calibration_idx >= len(calibration_setpoints):
+        calibration_running = False
+        output_text1.insert(tk.END, "Calibration complete!\n")
+        output_text1.see(tk.END)
+        return
+
+    sp = calibration_setpoints[calibration_idx]
+    send_setpoint_to_arduino(sp)
+    output_text1.insert(tk.END, f"Setpoint {sp} sent. Collecting data for {hold_time}s...\n")
+    output_text1.see(tk.END)
+
+    temp_fsr = []
+    temp_lc = []
+
+    def collect_data_for_setpoint(elapsed=0):
+        if not calibration_running:
+            return
+        # Get latest readings
+        if ble_buffer:
+            temp_fsr.append(ble_buffer[-1])
+        if lc_buffer:
+            temp_lc.append(lc_buffer[-1][0])
+        if elapsed < hold_time:
+            root.after(1000, lambda: collect_data_for_setpoint(elapsed + 1))
+        else:
+            # Store median values
+            median_fsr = np.median(temp_fsr) if temp_fsr else None
+            median_lc = np.median(temp_lc) if temp_lc else None
+            calibration_results.append((sp, median_fsr, median_lc))
+            output_text1.insert(tk.END, f"Setpoint {sp} done: FSR median={median_fsr}, LC median={median_lc}\n")
+            output_text1.see(tk.END)
+            # Move to next setpoint
+            global calibration_idx
+            calibration_idx += 1
+            run_setpoint_sequence(hold_time)
+
+    collect_data_for_setpoint()
+
+def plot_calibration_curve():
+    import matplotlib.pyplot as plt
+    if not lc_buffer or not ble_buffer:
+        messagebox.showinfo("No Data", "No data to plot calibration curve!")
+        return
+
+    n = min(len(lc_buffer), len(ble_buffer))
+    lc_inputs = np.array([lc_buffer[-n + i][0] for i in range(n)])
+    fsr_vals = np.array([ble_buffer[-n + i] for i in range(n)])
+
+    best_degree = 3
+    best_error = float('inf')
+    best_coeffs = None
+
+    for degree in range(1, 6):
+        coeffs = np.polyfit(fsr_vals, lc_inputs, degree)
+        fit_fn = np.poly1d(coeffs)
+        error = np.sum((lc_inputs - fit_fn(fsr_vals))**2)
+        if error < best_error:
+            best_error = error
+            best_degree = degree
+            best_coeffs = coeffs
+
+    fit_fn = np.poly1d(best_coeffs)  # type: ignore
+
+    # Smooth X range for curve
+    x_range = np.linspace(min(fsr_vals), max(fsr_vals), 300)
+    y_fit = fit_fn(x_range)
+
+    # Generate polynomial equation as a string
+    equation = " + ".join(
+        [f"{coef:.4g}x^{best_degree - i}" if best_degree - i > 1 else
+         (f"{coef:.4g}x" if best_degree - i == 1 else f"{coef:.4g}")
+         for i, coef in enumerate(best_coeffs)] # type: ignore
+    )
+
+    plt.figure()
+    plt.scatter(fsr_vals, lc_inputs, color='blue')
+    plt.plot(x_range, y_fit, color='red', linewidth=2)
+    plt.title(f"Calibration Curve:\n{equation}")
+    plt.xlabel("FSR Sensor Reading")
+    plt.ylabel("Load Cell Input")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_calibration_curve_from_results():
+    if not calibration_results:
+        messagebox.showinfo("No Data", "No calibration data available!")
+        return
+    setpoints, median_fsrs, median_lcs = zip(*calibration_results)
+    degree = 3
+    coeffs = np.polyfit(median_fsrs, median_lcs, degree)
+    fit_fn = np.poly1d(coeffs)
+    x_range = np.linspace(min(median_fsrs), max(median_fsrs), 300)
+    y_fit = fit_fn(x_range)
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.scatter(median_lcs, median_fsrs, label="median Points")
+    plt.plot(y_fit, x_range, color='red', label=f"Fit Degree {degree}")
+    plt.title("Calibration Curve: FSR vs LC_Input")
+    plt.xlabel("median FSR Sensor Reading")
+    plt.ylabel("median Load Cell Input")
+    plt.grid(True)
+    plt.text(0.05, 0.95, f'Equation:\n{fit_fn}', transform=plt.gca().transAxes, fontsize=10, color='red', verticalalignment='top')
+    plt.show()
+
+# --- GUI Functions ---
 def refresh_ports():
     ports = list_serial_ports()
     lc_port_combo['values'] = ports
@@ -221,34 +372,6 @@ def disconnect_ble():
     connect_button2.config(state=tk.NORMAL)
     disconnect_button2.config(state=tk.DISABLED)
     status_label2.config(text="Disconnected", fg="red")
-
-def send_pid():
-    global current_kp, current_ki, current_kd
-    if lc_serial and lc_serial.is_open:
-        try:
-            kp = float(kp_entry.get())
-            ki = float(ki_entry.get())
-            kd = float(kd_entry.get())
-            current_kp, current_ki, current_kd = kp, ki, kd
-            cmd = f"PID,{kp},{ki},{kd}\n"
-            lc_serial.write(cmd.encode())
-            output_text1.insert(tk.END, f"Sent: {cmd}")
-            output_text1.see(tk.END)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-def send_setpoint():
-    global setpoint_value
-    if lc_serial and lc_serial.is_open:
-        try:
-            setpoint = float(setpoint_entry.get())
-            setpoint_value = setpoint
-            cmd = f"SET,{setpoint}\n"
-            lc_serial.write(cmd.encode())
-            output_text1.insert(tk.END, f"Sent: {cmd}")
-            output_text1.see(tk.END)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
 
 def save_data():
     if not lc_buffer or not ble_buffer:
@@ -284,40 +407,6 @@ def plot_data():
     plt.ylabel("Value")
     plt.show()
 
-def plot_calibration_curve():
-    if not lc_buffer or not ble_buffer:
-        messagebox.showinfo("No Data", "No data to plot calibration curve!")
-        return
-    n = min(len(lc_buffer), len(ble_buffer))
-    lc_inputs = np.array([lc_buffer[-n + i][0] for i in range(n)])
-    fsr_vals = np.array([ble_buffer[-n + i] for i in range(n)])
-
-    best_degree = 1
-    best_error = float('inf')
-    best_coeffs = None
-
-    for degree in range(1, 6):
-        coeffs = np.polyfit(fsr_vals, lc_inputs, degree)
-        fit_fn = np.poly1d(coeffs)
-        error = np.sum((lc_inputs - fit_fn(fsr_vals))**2)
-        if error < best_error:
-            best_error = error
-            best_degree = degree
-            best_coeffs = coeffs
-
-    fit_fn = np.poly1d(best_coeffs) # type: ignore
-
-    plt.figure()
-    plt.scatter(fsr_vals, lc_inputs, label="Data Points")
-    plt.plot(fsr_vals, fit_fn(fsr_vals), color='red',
-             label=f"Best Fit Degree {best_degree}")
-    plt.title("Calibration Curve: FSR vs LC_Input")
-    plt.xlabel("FSR Sensor Reading")
-    plt.ylabel("Load Cell Input")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
 def sensor_selected(event=None):
     ble_buffer.clear()
 
@@ -329,38 +418,34 @@ def mode_changed():
         sensor_combo.grid_remove()
     ble_buffer.clear()
 
+# --- GUI Layout ---
 root = tk.Tk()
 root.title("Load Cell & BLE FSR Calibration GUI")
 
-logo1 = Image.open("iitlogo.png").resize((80, 80))
-logo2 = Image.open("excelsior.jpg").resize((80, 80))
-logo1_img = ImageTk.PhotoImage(logo1)
-logo2_img = ImageTk.PhotoImage(logo2)
-root.logo_images = [logo1_img, logo2_img]  # type: ignore
+try:
+    logo1 = Image.open("iitlogo.png").resize((80, 80))
+    logo2 = Image.open("excelsior.jpg").resize((80, 80))
+    logo1_img = ImageTk.PhotoImage(logo1)
+    logo2_img = ImageTk.PhotoImage(logo2)
+    root.logo_images = [logo1_img, logo2_img] # type: ignore
 
-# Create a frame for the logos and title
-logo_frame = ttk.Frame(root)
-logo_frame.grid(row=0, column=0, columnspan=7, sticky="ew", pady=(10,0))
+    logo_frame = ttk.Frame(root)
+    logo_frame.grid(row=0, column=0, columnspan=8, sticky="ew", pady=(10,0))
+    logo1_label = tk.Label(logo_frame, image=logo1_img)
+    logo1_label.pack(side=tk.LEFT, padx=(0,10))
+    title_label = tk.Label(
+        logo_frame,
+        text="UTM FOR SMART INSOLE CALIBRATION",
+        font=("Arial", 20, "bold")
+    )
+    title_label.pack(side=tk.LEFT, padx=50)
+    logo2_label = tk.Label(logo_frame, image=logo2_img)
+    logo2_label.pack(side=tk.LEFT, padx=(10,0))
+except Exception:
+    pass
 
-# Place first logo
-logo1_label = tk.Label(logo_frame, image=logo1_img)
-logo1_label.pack(side=tk.LEFT, padx=(0,10))
-
-# Place center text
-title_label = tk.Label(
-    logo_frame,
-    text="UTM FOR SMART INSOLE CALIBRATION",
-    font=("Arial", 20, "bold")
-)
-title_label.pack(side=tk.LEFT, padx=50)
-
-# Place second logo
-logo2_label = tk.Label(logo_frame, image=logo2_img)
-logo2_label.pack(side=tk.LEFT, padx=(10,0))
-
-# Now place your mainframe below the logo_frame
 mainframe = ttk.Frame(root, padding="10")
-mainframe.grid(row=1, column=0, sticky=(tk.N, tk.W, tk.E, tk.S)) # type: ignore
+mainframe.grid(row=0, column=0, sticky="nwes")
 
 mode_var = tk.StringVar(value="multi")
 ttk.Label(mainframe, text="Mode:").grid(row=0, column=0, sticky=tk.W)
@@ -415,6 +500,7 @@ setpoint_entry.grid(row=4, column=1, sticky=tk.W)
 setpoint_button = ttk.Button(mainframe, text="Send Setpoint", command=send_setpoint)
 setpoint_button.grid(row=4, column=2, sticky=tk.W)
 
+# Adaptive PID button
 adaptation_button = ttk.Button(mainframe, text="Start Adaptation", command=toggle_adaptation)
 adaptation_button.grid(row=4, column=3, sticky=tk.W)
 
@@ -428,8 +514,32 @@ save_button = ttk.Button(mainframe, text="Save Data", command=save_data)
 save_button.grid(row=6, column=0, sticky=tk.W)
 plot_button = ttk.Button(mainframe, text="Plot Data", command=plot_data)
 plot_button.grid(row=6, column=1, sticky=tk.W)
-calib_button = ttk.Button(mainframe, text="Plot Calibration", command=plot_calibration_curve)
+calib_button = ttk.Button(mainframe, text="Plot Calibration", command=plot_calibration_curve_from_results)
 calib_button.grid(row=6, column=2, sticky=tk.W)
+
+# --- Calibration Controls ---
+ttk.Label(mainframe, text="Min Setpoint:").grid(row=9, column=0, sticky=tk.W)
+min_setpoint_entry = ttk.Entry(mainframe, width=10)
+min_setpoint_entry.insert(0, "1000")
+min_setpoint_entry.grid(row=9, column=1, sticky=tk.W)
+
+ttk.Label(mainframe, text="Max Setpoint:").grid(row=9, column=2, sticky=tk.W)
+max_setpoint_entry = ttk.Entry(mainframe, width=10)
+max_setpoint_entry.insert(0, "5000")
+max_setpoint_entry.grid(row=9, column=3, sticky=tk.W)
+
+ttk.Label(mainframe, text="Step:").grid(row=9, column=4, sticky=tk.W)
+step_entry = ttk.Entry(mainframe, width=7)
+step_entry.insert(0, "1000")
+step_entry.grid(row=9, column=5, sticky=tk.W)
+
+ttk.Label(mainframe, text="Hold Time (s):").grid(row=9, column=6, sticky=tk.W)
+hold_time_entry = ttk.Entry(mainframe, width=7)
+hold_time_entry.insert(0, "50")
+hold_time_entry.grid(row=9, column=7, sticky=tk.W)
+
+start_calib_button = ttk.Button(mainframe, text="Start Auto Calibration", command=start_auto_calibration)
+start_calib_button.grid(row=10, column=0, columnspan=2, sticky=tk.W)
 
 output_text1 = tk.Text(mainframe, height=6, width=40)
 output_text1.grid(row=7, column=0, columnspan=3, pady=5)
@@ -453,7 +563,7 @@ ax2.set_ylabel("Value")
 fig.subplots_adjust(bottom=0.18)
 
 canvas = FigureCanvasTkAgg(fig, master=mainframe)
-canvas.get_tk_widget().grid(row=8, column=0, columnspan=7, pady=10)
+canvas.get_tk_widget().grid(row=8, column=0, columnspan=8, pady=10)
 
 def update_plot():
     if lc_buffer:
@@ -479,4 +589,5 @@ def update_plot():
 update_plot()
 mode_changed()
 refresh_ports()
+root.resizable(False,False)
 root.mainloop()
